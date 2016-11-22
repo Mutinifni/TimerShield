@@ -23,6 +23,8 @@
 #include <linux/percpu.h>
 #include <linux/timer.h>
 #include <linux/timerqueue.h>
+#include <linux/sched/prio.h>
+#include <linux/segtree.h>
 
 struct hrtimer_clock_base;
 struct hrtimer_cpu_base;
@@ -89,6 +91,8 @@ enum hrtimer_restart {
  * @state:	state information (See bit values above)
  * @cb_entry:	list entry to defer timers from hardirq context
  * @irqsafe:	timer can run in hardirq context
+ * @sched_prio: scheduler priority from task_struct of the process which
+ *		started the timer
  * @praecox:	timer expiry time if expired at the time of programming
  * @is_rel:	Set if the timer was armed relative
  * @start_pid:  timer statistics field to store the pid of the task which
@@ -108,6 +112,7 @@ struct hrtimer {
 	u8				state;
 	struct list_head		cb_entry;
 	int				irqsafe;
+	int				sched_prio;
 #ifdef CONFIG_MISSED_TIMER_OFFSETS_HIST
 	ktime_t				praecox;
 #endif
@@ -118,6 +123,7 @@ struct hrtimer {
 	char				start_comm[16];
 #endif
 };
+
 
 /**
  * struct hrtimer_sleeper - simple sleeper structure
@@ -148,7 +154,8 @@ struct hrtimer_clock_base {
 	struct hrtimer_cpu_base	*cpu_base;
 	int			index;
 	clockid_t		clockid;
-	struct timerqueue_head	active;
+	struct timerqueue_head	active[MAX_PRIO];
+	struct segtree_node	st[MAX_PRIO << 1];
 	struct list_head	expired;
 	ktime_t			(*get_time)(void);
 	ktime_t			offset;
@@ -218,8 +225,6 @@ struct hrtimer_cpu_base {
 
 static inline void hrtimer_set_expires(struct hrtimer *timer, ktime_t time)
 {
-	BUILD_BUG_ON(sizeof(struct hrtimer_clock_base) > HRTIMER_CLOCK_BASE_ALIGN);
-
 	timer->node.expires = time;
 	timer->_softexpires = time;
 }
@@ -512,3 +517,5 @@ extern void __init hrtimers_init(void);
 extern void sysrq_timer_list_show(void);
 
 #endif
+
+extern void hrtimer_context_switch_timershield(void);

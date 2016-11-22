@@ -20,7 +20,6 @@ static enum hrtimer_restart sched_rt_period_timer(struct hrtimer *timer)
 		container_of(timer, struct rt_bandwidth, rt_period_timer);
 	int idle = 0;
 	int overrun;
-
 	raw_spin_lock(&rt_b->rt_runtime_lock);
 	for (;;) {
 		overrun = hrtimer_forward_now(timer, rt_b->rt_period);
@@ -49,6 +48,7 @@ void init_rt_bandwidth(struct rt_bandwidth *rt_b, u64 period, u64 runtime)
 			CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	rt_b->rt_period_timer.irqsafe = 1;
 	rt_b->rt_period_timer.function = sched_rt_period_timer;
+	rt_b->rt_period_timer.sched_prio = -1;
 }
 
 static void start_rt_bandwidth(struct rt_bandwidth *rt_b)

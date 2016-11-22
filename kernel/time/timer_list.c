@@ -98,7 +98,7 @@ next_one:
 	i = 0;
 	raw_spin_lock_irqsave(&base->cpu_base->lock, flags);
 
-	curr = timerqueue_getnext(&base->active);
+	curr = timerqueue_getnext(&base->active[current->normal_prio]);
 	/*
 	 * Crude but we have to do this O(N*N) thing, because
 	 * we have to unlock the base when printing:

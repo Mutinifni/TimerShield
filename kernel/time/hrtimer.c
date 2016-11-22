@@ -482,9 +482,19 @@ static ktime_t __hrtimer_get_next_event(struct hrtimer_cpu_base *cpu_base)
 		if (!(active & 0x01))
 			continue;
 
-		next = timerqueue_getnext(&base->active);
+		next = timerqueue_getnext_timershield(current->normal_prio,
+				base->st);
+
+		if (next == NULL)
+		{
+			if (expires_next.tv64 == KTIME_MAX)
+				hrtimer_update_next_timer(cpu_base, NULL);
+			continue;
+		}
+
 		timer = container_of(next, struct hrtimer, node);
 		expires = ktime_sub(hrtimer_get_expires(timer), base->offset);
+
 		if (expires.tv64 < expires_next.tv64) {
 			expires_next = expires;
 			hrtimer_update_next_timer(cpu_base, timer);
@@ -940,7 +950,42 @@ static int enqueue_hrtimer(struct hrtimer *timer,
 
 	timer->state = HRTIMER_STATE_ENQUEUED;
 
-	return timerqueue_add(&base->active, &timer->node);
+	if (timer->sched_prio < 0)
+		return timerqueue_add_timershield(&base->active[0],
+				&timer->node, base->st);
+	else
+	{
+		timer->sched_prio = current->normal_prio;
+		return timerqueue_add_timershield(&base->active[timer->sched_prio],
+				&timer->node, base->st);
+	}
+}
+
+/*
+ * enqueue_hrtimer_with_prio - internal function to (re)start a timer
+ *
+ * The timer is inserted in expiry order with specified priority.
+ * Insertion into the red black tree is O(log(n)). Must hold the base lock.
+ *
+ * Returns 1 when the new timer is the leftmost timer in the tree.
+ */
+static int enqueue_hrtimer_with_prio(struct hrtimer *timer,
+			   struct hrtimer_clock_base *base, int prio)
+{
+	debug_activate(timer);
+
+	base->cpu_base->active_bases |= 1 << base->index;
+
+	timer->state = HRTIMER_STATE_ENQUEUED;
+
+	timer->sched_prio = prio;
+
+	if (prio < 0)
+		return timerqueue_add_timershield(&base->active[0],
+				&timer->node, base->st);
+	else
+		return timerqueue_add_timershield(&base->active[prio],
+				&timer->node, base->st);
 }
 
 /*
@@ -959,6 +1004,7 @@ static void __remove_hrtimer(struct hrtimer *timer,
 {
 	struct hrtimer_cpu_base *cpu_base = base->cpu_base;
 	u8 state = timer->state;
+	int sched_prio;
 
 	timer->state = newstate;
 	if (!(state & HRTIMER_STATE_ENQUEUED))
@@ -969,7 +1015,14 @@ static void __remove_hrtimer(struct hrtimer *timer,
 		return;
 	}
 
-	if (!timerqueue_del(&base->active, &timer->node))
+	if (timer->sched_prio < 0)
+		sched_prio = 0;
+	else
+		sched_prio = timer->sched_prio;
+
+
+	if (!timerqueue_del_timershield(&base->active[sched_prio],
+				&timer->node, base->st))
 		cpu_base->active_bases &= ~(1 << base->index);
 
 #ifdef CONFIG_HIGH_RES_TIMERS
@@ -1299,7 +1352,6 @@ static void __run_hrtimer(struct hrtimer_cpu_base *cpu_base,
 	 * timer->state == INACTIVE.
 	 */
 	raw_write_seqcount_barrier(&cpu_base->seq);
-
 	__remove_hrtimer(timer, base, HRTIMER_STATE_INACTIVE, 0);
 	timer_stats_account_hrtimer(timer);
 	fn = timer->function;
@@ -1450,25 +1502,36 @@ static inline int hrtimer_rt_defer(struct hrtimer *timer) { return 0; }
 
 static enum hrtimer_restart hrtimer_wakeup(struct hrtimer *timer);
 
-static void __hrtimer_run_queues(struct hrtimer_cpu_base *cpu_base, ktime_t now)
+static int __hrtimer_run_queues(struct hrtimer_cpu_base *cpu_base, ktime_t now)
 {
 	struct hrtimer_clock_base *base = cpu_base->clock_base;
 	unsigned int active = cpu_base->active_bases;
 	int raise = 0;
+	int prev_prio;
+	int was_higher_prio = 0;
 
 	for (; active; base++, active >>= 1) {
 		struct timerqueue_node *node;
 		ktime_t basenow;
+		prev_prio = MAX_PRIO;
 
 		if (!(active & 0x01))
 			continue;
 
 		basenow = ktime_add(now, base->offset);
 
-		while ((node = timerqueue_getnext(&base->active))) {
+		while ((node = timerqueue_getnext_timershield(
+					current->normal_prio, base->st))) {
 			struct hrtimer *timer;
 
 			timer = container_of(node, struct hrtimer, node);
+
+			if (timer->sched_prio > prev_prio) {
+				was_higher_prio = 1;
+				break;
+			}
+
+			prev_prio = timer->sched_prio;
 
 			trace_hrtimer_interrupt(raw_smp_processor_id(),
 			    ktime_to_ns(ktime_sub(ktime_to_ns(timer->praecox) ?
@@ -1502,6 +1565,8 @@ static void __hrtimer_run_queues(struct hrtimer_cpu_base *cpu_base, ktime_t now)
 	}
 	if (raise)
 		raise_softirq_irqoff(HRTIMER_SOFTIRQ);
+
+	return was_higher_prio;
 }
 
 #ifdef CONFIG_HIGH_RES_TIMERS
@@ -1515,6 +1580,7 @@ void hrtimer_interrupt(struct clock_event_device *dev)
 	struct hrtimer_cpu_base *cpu_base = this_cpu_ptr(&hrtimer_bases);
 	ktime_t expires_next, now, entry_time, delta;
 	int retries = 0;
+	int was_higher_prio = 0;
 
 	BUG_ON(!cpu_base->hres_active);
 	cpu_base->nr_events++;
@@ -1533,7 +1599,16 @@ retry:
 	 */
 	cpu_base->expires_next.tv64 = KTIME_MAX;
 
-	__hrtimer_run_queues(cpu_base, now);
+	was_higher_prio = __hrtimer_run_queues(cpu_base, now);
+
+	if (was_higher_prio) {
+		hrtimer_update_next_timer(cpu_base, NULL);
+		tick_program_event(cpu_base->expires_next, 1);
+		cpu_base->in_hrtirq = 0;
+		raw_spin_unlock(&cpu_base->lock);
+		cpu_base->hang_detected = 0;
+		return;
+	}
 
 	/* Reevaluate the clock bases for the next expiry */
 	expires_next = __hrtimer_get_next_event(cpu_base);
@@ -1825,10 +1900,12 @@ static void init_hrtimers_cpu(int cpu)
 {
 	struct hrtimer_cpu_base *cpu_base = &per_cpu(hrtimer_bases, cpu);
 	int i;
+	int j;
 
 	for (i = 0; i < HRTIMER_MAX_CLOCK_BASES; i++) {
 		cpu_base->clock_base[i].cpu_base = cpu_base;
-		timerqueue_init_head(&cpu_base->clock_base[i].active);
+		for (j = 0; j < MAX_PRIO; j++)
+			timerqueue_init_head(&cpu_base->clock_base[i].active[j]);
 		INIT_LIST_HEAD(&cpu_base->clock_base[i].expired);
 	}
 
@@ -1844,30 +1921,34 @@ static void init_hrtimers_cpu(int cpu)
 static void migrate_hrtimer_list(struct hrtimer_clock_base *old_base,
 				struct hrtimer_clock_base *new_base)
 {
+	int prio;
 	struct hrtimer *timer;
 	struct timerqueue_node *node;
 
-	while ((node = timerqueue_getnext(&old_base->active))) {
-		timer = container_of(node, struct hrtimer, node);
-		BUG_ON(hrtimer_callback_running(timer));
-		debug_deactivate(timer);
+	for (prio = 0; prio < MAX_PRIO; prio++)
+	{
+		while ((node = timerqueue_getnext(&old_base->active[prio]))) {
+			timer = container_of(node, struct hrtimer, node);
+			BUG_ON(hrtimer_callback_running(timer));
+			debug_deactivate(timer);
 
-		/*
-		 * Mark it as ENQUEUED not INACTIVE otherwise the
-		 * timer could be seen as !active and just vanish away
-		 * under us on another CPU
-		 */
-		__remove_hrtimer(timer, old_base, HRTIMER_STATE_ENQUEUED, 0);
-		timer->base = new_base;
-		/*
-		 * Enqueue the timers on the new cpu. This does not
-		 * reprogram the event device in case the timer
-		 * expires before the earliest on this CPU, but we run
-		 * hrtimer_interrupt after we migrated everything to
-		 * sort out already expired timers and reprogram the
-		 * event device.
-		 */
-		enqueue_hrtimer(timer, new_base);
+			/*
+			 * Mark it as ENQUEUED not INACTIVE otherwise the
+			 * timer could be seen as !active and just vanish away
+			 * under us on another CPU
+			 */
+			__remove_hrtimer(timer, old_base, HRTIMER_STATE_ENQUEUED, 0);
+			timer->base = new_base;
+			/*
+			 * Enqueue the timers on the new cpu. This does not
+			 * reprogram the event device in case the timer
+			 * expires before the earliest on this CPU, but we run
+			 * hrtimer_interrupt after we migrated everything to
+			 * sort out already expired timers and reprogram the
+			 * event device.
+			 */
+			enqueue_hrtimer_with_prio(timer, new_base, timer->sched_prio);
+		}
 	}
 }
 
@@ -2063,3 +2144,126 @@ int __sched schedule_hrtimeout(ktime_t *expires,
 	return schedule_hrtimeout_range(expires, 0, mode);
 }
 EXPORT_SYMBOL_GPL(schedule_hrtimeout);
+
+/**
+ * hrtimer_context_switch_timershield - process expired hrtimers of maximum
+ * priority during context switches and optionally reprogram hrtimer
+ * hardware using a priority aware range query.
+ */
+void hrtimer_context_switch_timershield()
+{
+	struct hrtimer_cpu_base *cpu_base = this_cpu_ptr(&hrtimer_bases);
+
+	if (!cpu_base->hres_active)
+		return;
+
+	struct hrtimer_clock_base *base = cpu_base->clock_base;
+	unsigned int active = cpu_base->active_bases;
+	struct timerqueue_node *to_reprog = NULL;
+	struct hrtimer *timer = NULL;
+	unsigned long flags;
+	ktime_t now;
+	int prev_prio;
+	int raise = 0;
+
+	local_irq_save(flags);
+	raw_spin_lock(&cpu_base->lock);
+
+	now = hrtimer_update_base(cpu_base);
+
+	for (; active; base++, active >>= 1) {
+		struct timerqueue_node *next;
+		ktime_t basenow;
+		timer = NULL;
+		prev_prio = MAX_PRIO;
+
+		if (!(active & 0x01))
+			continue;
+
+		basenow = ktime_add(now, base->offset);
+
+		while ((next = timerqueue_getnext_timershield(
+					current->normal_prio, base->st))) {
+			timer = container_of(next, struct hrtimer, node);
+
+			if (timer->sched_prio > prev_prio)
+				break;
+
+			prev_prio = timer->sched_prio;
+
+			if (basenow.tv64 < hrtimer_get_softexpires_tv64(timer))
+				break;
+
+			if (!hrtimer_rt_defer(timer))
+				__run_hrtimer(cpu_base, base, timer, &basenow);
+			else
+				raise = 1;
+		}
+
+		if (next == NULL)
+			continue;
+
+		timer = container_of(next, struct hrtimer, node);
+
+		if (timer->sched_prio > prev_prio)
+			continue;
+
+		if (to_reprog == NULL)
+		{
+			to_reprog = next;
+			continue;
+		}
+
+		if (next->expires.tv64 < to_reprog->expires.tv64)
+			to_reprog = next;
+	}
+	if (raise)
+		raise_softirq_irqoff(HRTIMER_SOFTIRQ);
+
+
+	if (to_reprog == NULL)
+	{
+		if (cpu_base->next_timer == NULL) {
+			raw_spin_unlock(&cpu_base->lock);
+			local_irq_restore(flags);
+			return;
+		}
+
+		hrtimer_update_next_timer(cpu_base, NULL);
+		cpu_base->expires_next.tv64 = KTIME_MAX;
+
+		if (cpu_base->hang_detected) {
+			raw_spin_unlock(&cpu_base->lock);
+			local_irq_restore(flags);
+			return;
+		}
+
+		raw_spin_unlock(&cpu_base->lock);
+
+		tick_program_event(cpu_base->expires_next, 1);
+		local_irq_restore(flags);
+		return;
+	}
+
+	timer = container_of(to_reprog, struct hrtimer, node);
+
+	if (timer != cpu_base->next_timer) {
+		hrtimer_update_next_timer(cpu_base, timer);
+		cpu_base->expires_next.tv64 = to_reprog->expires.tv64;
+
+		if (cpu_base->hang_detected) {
+			raw_spin_unlock(&cpu_base->lock);
+			local_irq_restore(flags);
+			return;
+		}
+
+		raw_spin_unlock(&cpu_base->lock);
+
+		tick_program_event(cpu_base->expires_next, 1);
+		local_irq_restore(flags);
+		return;
+	}
+
+	raw_spin_unlock(&cpu_base->lock);
+	local_irq_restore(flags);
+}

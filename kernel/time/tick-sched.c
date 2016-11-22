@@ -1081,6 +1081,7 @@ static void tick_nohz_switch_to_nohz(void)
 	 * hrtimer_forward with the highres code.
 	 */
 	hrtimer_init(&ts->sched_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+	ts->sched_timer.sched_prio = -1;
 	/* Get the next period */
 	next = tick_init_jiffy_update();
 
@@ -1168,7 +1169,6 @@ static enum hrtimer_restart tick_sched_timer(struct hrtimer *timer)
 	ktime_t now = ktime_get();
 
 	tick_sched_do_timer(now);
-
 	/*
 	 * Do not call, when we are not in irq context and have
 	 * no valid regs pointer
@@ -1209,6 +1209,7 @@ void tick_setup_sched_timer(void)
 	hrtimer_init(&ts->sched_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
 	ts->sched_timer.irqsafe = 1;
 	ts->sched_timer.function = tick_sched_timer;
+	ts->sched_timer.sched_prio = -1;
 
 	/* Get the next period (per cpu) */
 	hrtimer_set_expires(&ts->sched_timer, tick_init_jiffy_update());

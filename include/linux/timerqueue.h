@@ -2,8 +2,8 @@
 #define _LINUX_TIMERQUEUE_H
 
 #include <linux/rbtree.h>
+#include <linux/segtree.h>
 #include <linux/ktime.h>
-
 
 struct timerqueue_node {
 	struct rb_node node;
@@ -22,6 +22,12 @@ extern bool timerqueue_del(struct timerqueue_head *head,
 			   struct timerqueue_node *node);
 extern struct timerqueue_node *timerqueue_iterate_next(
 						struct timerqueue_node *node);
+extern struct timerqueue_node *timerqueue_getnext_timershield(
+		int cur_prio, struct segtree_node *st);
+extern bool timerqueue_add_timershield(struct timerqueue_head *head,
+		struct timerqueue_node *node, struct segtree_node *st);
+extern bool timerqueue_del_timershield(struct timerqueue_head *head,
+		struct timerqueue_node *node, struct segtree_node *st);
 
 /**
  * timerqueue_getnext - Returns the timer with the earliest expiration time

@@ -311,6 +311,7 @@ static void init_rq_hrtick(struct rq *rq)
 	hrtimer_init(&rq->hrtick_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	rq->hrtick_timer.function = hrtick;
 	rq->hrtick_timer.irqsafe = 1;
+	rq->hrtick_timer.sched_prio = -1;
 }
 #else	/* CONFIG_SCHED_HRTICK */
 static inline void hrtick_clear(struct rq *rq)
@@ -2770,6 +2771,10 @@ static struct rq *finish_task_switch(struct task_struct *prev)
 	}
 
 	tick_nohz_task_switch();
+
+	if (current->normal_prio != prev->normal_prio)
+		hrtimer_context_switch_timershield();
+
 	return rq;
 }
 
